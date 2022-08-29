@@ -1,0 +1,488 @@
+#Clasificacion de estapas de sueño utilizando wivelets y el dataset de sleep-edf
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import plot_confusion_matrix
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, confusion_matrix, multilabel_confusion_matrix
+from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit
+from sklearn.decomposition import PCA
+from sklearn.svm import SVC
+import tSNE
+import metrics
+import read_EDF_data_per_sj_5
+import balance_data
+import matplotlib.pyplot as plt
+import numpy as np
+import argparse
+import pywt
+import pandas as pd
+import mne
+import random
+import seaborn as sns
+from pathlib import Path
+from scipy.stats import norm, kurtosis, skew, entropy
+from scipy.signal import welch
+import scipy as sp
+import collections
+import copy
+import joblib
+
+
+def plot_wavelet(mat, labels):
+
+    labels= list(labels)
+    
+    w = labels.index(1)
+    s1 = labels.index(2)
+    s2 = labels.index(3)
+    sws = labels.index(4)
+    r = labels.index(5)
+
+    plt.figure(1)
+    plt.subplot(511)
+    plt.plot(mat[w,:])
+    plt.subplot(512)
+    plt.plot(mat[s1,:])
+    plt.subplot(513)
+    plt.plot(mat[s2,:])
+    plt.subplot(514)
+    plt.plot(mat[sws,:])
+    plt.subplot(515)
+    plt.plot(mat[r,:])
+
+    plt.show()
+    
+def get_new_data(epochs):
+    #tener en cuenta que no van a tener el mismo orden
+    #for e in epochs:
+    aux = []
+    #MODELO 1
+    print(epochs)
+    s1= epochs['Sleep stage 1']
+    s2= epochs['Sleep stage 2']
+    sws= epochs['Sleep stage 3/4']
+
+
+    aux.insert(len(aux),s1)
+    aux.insert(len(aux),s2)
+    aux.insert(len(aux),sws)
+    #print('tipos ', type(s1))
+    return mne.concatenate_epochs(aux)
+
+def wavelet_level(señal, level,wavelet, valid, medias, stds):
+    train_matrix= []
+    level = int(level)
+    for e in señal:
+        if level == 1:
+            CA_EEG, _ = pywt.wavedec(e[0,:],wavelet,level=1)
+            CA_EOG, _ = pywt.wavedec(e[1,:],wavelet,level=1)
+            CA_EMG, _ = pywt.wavedec(e[2,:],wavelet,level=1)
+        if level == 2:
+            CA_EEG, _, _ = pywt.wavedec(e[0,:],wavelet,level=2)
+            CA_EOG, _, _ = pywt.wavedec(e[1,:],wavelet,level=2)
+            CA_EMG, _, _ = pywt.wavedec(e[2,:],wavelet,level=2)
+        if level == 3:
+            CA_EEG, _, _, _ = pywt.wavedec(e[0:],wavelet,level=3)
+            CA_EOG, _, _, _ = pywt.wavedec(e[1:],wavelet,level=3)
+            CA_EMG, _, _, _ = pywt.wavedec(e[2:],wavelet,level=3)
+        if level == 4:
+            CA_EEG, _, _, _, _ = pywt.wavedec(e[0,:],wavelet,level=4)
+            CA_EOG, _, _, _, _ = pywt.wavedec(e[1,:],wavelet,level=4)
+            CA_EMG, _, _, _, _ = pywt.wavedec(e[2,:],wavelet,level=4)
+        if level == 5:
+            CA_EEG, _, _, _, _, _ = pywt.wavedec(e[0,:],wavelet,level=5)
+            CA_EOG, _, _, _, _, _ = pywt.wavedec(e[1,:],wavelet,level=5)
+            CA_EMG, _, _, _, _, _ = pywt.wavedec(e[2,:],wavelet,level=5)
+    
+        mean_eeg = np.mean(CA_EEG)
+        median_eeg = np.median(CA_EEG)
+        std_eeg = np.std(CA_EEG)
+        kurt_eeg = kurtosis(CA_EEG,axis=None)
+        sk_eeg = skew(CA_EEG,axis=None)
+
+        mean_eog = np.mean(CA_EOG)
+        median_eog = np.median(CA_EOG)
+        std_eog = np.std(CA_EOG)
+        kurt_eog = kurtosis(CA_EOG,axis=None)
+        sk_eog = skew(CA_EOG,axis=None)
+
+        mean_emg = np.mean(CA_EMG)
+        median_emg = np.median(CA_EMG)
+        std_emg = np.std(CA_EMG)
+        kurt_emg = kurtosis(CA_EMG,axis=None)
+        sk_emg = skew(CA_EMG,axis=None)
+
+        Features = np.array([mean_eeg,median_eeg,std_eeg,kurt_eeg,sk_eeg,mean_eog,median_eog,std_eog,kurt_eog,sk_eog,mean_emg,median_emg,std_emg,kurt_emg,sk_emg])
+        #Features = np.array([mean_eeg,median_eeg,std_eeg,kurt_eeg,sk_eeg])
+        #Features = np.array([mean_eeg,median_eeg,std_eeg,kurt_eeg,sk_eeg,mean_eog,median_eog,std_eog,kurt_eog,sk_eog])
+
+
+
+        if valid==0:
+            train_matrix.append(Features)
+        else:
+            for i in range(len(Features)):
+                Features[i]= (Features[i]-medias[i])/stds[i]
+            train_matrix.insert(len(train_matrix), Features)
+
+
+    return train_matrix
+
+def normalize_mat(mat):
+    print('ENTRO A NORM')
+    row,col= mat.shape
+    media = np.empty(col)
+    std = np.empty(col)
+    new_mat = np.empty((row,col))
+    #print('columna: ', col)
+    for i in range(col):
+        media[i] = np.mean(mat[:,i])
+        std[i] = np.std(mat[:,i])
+
+        for j in range(row):
+            #print(mat[j,i])
+            aux = (mat[j,i] - float(media[i]))/float(std[i])
+            new_mat[j,i]=aux
+    return new_mat, media, std
+
+def train_data(wavelet, rus, level, features, trees, epochs, index):
+    
+    valid = epochs[index]
+    print('SUJETO: ', index)
+    epochs.pop(index)
+
+    epochs = mne.concatenate_epochs(epochs)
+    labels = epochs.events[:, -1]
+
+    #WAVELET ENTRENAMIENTO
+    train_matrix= wavelet_level(epochs,level,wavelet,0,0,0)
+    train_matrix = np.array(train_matrix)
+
+    #ESTANDARIZACION ENTRENAMIEO
+    train_norm, medias, stds = normalize_mat(train_matrix)
+
+    
+
+
+    #PCA
+    if features != -1:
+        pca = PCA(n_components=features)
+        train_norm = pca.fit_transform(train_norm)
+
+    #ACOMODAR LABELS PARA QUE QUEDEN DOS CLASES
+    # labels[labels==1]=1
+    # labels[labels==5]=1 
+    # labels[labels==2]=2 
+    # labels[labels==3]=2 
+    # labels[labels==4]=2 
+
+    #WAKE-REM-S1 VS S2-SWS
+    labels[labels==1]=1
+    labels[labels==5]=1 
+    labels[labels==2]=1 
+    labels[labels==3]=2 
+    labels[labels==4]=2 
+
+
+    #RANDOM FOREST
+    clf1 = RandomForestClassifier(n_estimators=trees ,random_state=random.seed(1234))
+    clf1.fit(train_norm,labels)
+
+
+    #WAVELET VALIDACION
+    valid_wavelet = wavelet_level(valid,level,wavelet,1,medias,stds)
+    y_valid = valid.events[:,-1]
+      
+
+    valid_matrix = np.array(valid_wavelet)
+    
+    if features != -1:
+        valid_matrix=pca.transform(valid_matrix)
+    
+    y_predict = clf1.predict(valid_matrix)
+
+    #ACOMODAR LABELS PARA SEPARAR EN DOS CLASES
+    # y_valid[y_valid==1]=1
+    # y_valid[y_valid==5]=1 
+    # y_valid[y_valid==2]=2 
+    # y_valid[y_valid==3]=2 
+    # y_valid[y_valid==4]=2
+
+    #WAKE-REM-S1 VS S2-SWS
+    y_valid[y_valid==1]=1
+    y_valid[y_valid==5]=1 
+    y_valid[y_valid==2]=1 
+    y_valid[y_valid==3]=2 
+    y_valid[y_valid==4]=2
+
+
+
+    acc = (accuracy_score(y_valid,y_predict))
+    f1 = (f1_score(y_valid,y_predict,average='macro'))
+
+    print('VALID: ', collections.Counter(y_valid))
+    print('PRED: ', collections.Counter(y_predict))
+
+    
+    WR, S1234 = multilabel_confusion_matrix(y_valid, y_predict)
+
+    acc_wr, f1_wr = metrics.get_metrics(WR,1)
+    acc_s1234, f1_s1234 = metrics.get_metrics(S1234,1)
+    
+    f = open("Acc_cascade.txt", "w")
+    f.write('Data: '+ 'acc: '+ str(np.mean(acc)) +'acc_w '+ str(np.mean(acc_wr))+'acc_s1 '+ str(np.mean(acc_s1234)))
+    f.close()
+
+
+    #print('acc: ', acc, ' f1: ', f1, ' pres: ', pres, ' rec: ', rec)
+    return acc, acc_wr, acc_s1234, f1, f1_wr, f1_s1234
+
+#def save_results(f1, f1_s1, f1_s2, f1_sws, w, r, l, f,t):
+def save_results(f1, f1_wr, f1_s1234, w, r, l, f,t):
+
+    df = pd.read_csv("results_cascade_1.csv")
+    f1= np.mean(f1)
+
+    f1_wr = np.mean(f1_wr)
+    f1_s1234= np.mean(f1_s1234)
+    #print(' RESULTADOS OBTENIDOS A GAURDAR ',f1, f1_s1, f1_s2, f1_sws )
+
+    df[w + '_' + str(r) + '_' + str(l) + '_' + str(f)+'_' + str(t)] = [f1, f1_wr, f1_s1234]
+
+    df.to_csv("results_cascade_1.csv", index=False)
+
+    #line = 'modelo' + w + str(r) + str(l) + str(f): [f1, f1_s1,f1_s2,f1_s3]
+
+def train(wavelet, rus, level, features,trees, epochs, test_epochs):
+ 
+
+    acc = np.empty(len(test_epochs))
+    f1 = np.empty(len(test_epochs))
+
+    acc_wr = np.empty(len(test_epochs))
+    f1_wr = np.empty(len(test_epochs))
+
+    acc_s1234 = np.empty(len(test_epochs))
+    f1_s1234 = np.empty(len(test_epochs))
+
+    epochs = mne.concatenate_epochs(epochs)
+    labels = epochs.events[:, -1]    
+
+    #WAVELET ENTRENAMIENTO
+    train_matrix= wavelet_level(epochs,level,wavelet,0,0,0)
+    train_matrix = np.array(train_matrix)
+
+    #ESTANDARIZACION ENTRENAMIEO
+    train_norm, medias, stds = normalize_mat(train_matrix)
+    np.save('medias_1.npy', medias)
+    np.save('std_1.npy', stds)
+
+
+    #PCA
+    pca = PCA(n_components=features)
+    if features != -1:
+        print('ENTRA A PCA')
+        train_norm = pca.fit_transform(train_norm)
+
+    #ACOMODAR LABELS PARA QUE QUEDEN DOS CLASES
+    # labels[labels==1]=1
+    # labels[labels==5]=1 
+    # labels[labels==2]=2 
+    # labels[labels==3]=2 
+    # labels[labels==4]=2 
+
+    #WAKE-REM-S1 VS S2-SWS
+    labels[labels==1]=1
+    labels[labels==5]=1 
+    labels[labels==2]=1 
+    labels[labels==3]=2 
+    labels[labels==4]=2 
+
+    
+
+    #RANDOM FOREST
+    clf1 = RandomForestClassifier(n_estimators=trees ,random_state=random.seed(1234))
+    clf1.fit(train_norm,labels)
+
+    #guardo el modelo
+    joblib.dump(clf1, "./cascade_1.joblib")
+
+
+    index = 0
+    for t in test_epochs:
+        (acc[index], acc_wr[index], acc_s1234[index],
+        f1[index], f1_wr[index], f1_s1234[index]) = predecir_sj(wavelet,rus, level, features, clf1,t, medias,stds,pca)
+
+        index = index +1
+
+    f = open("Acc_cascade_1.txt", "w")
+    f.write('Data: '+ 'acc: '+ str(np.mean(acc)) +'acc_wr '+ str(np.mean(acc_wr))+'acc_s1234 '+ str(np.mean(acc_s1234)))
+    f.close()
+
+    file = open("Fscore_cascade_1.txt", "w")
+    file.write('Data: '+ 'fs_wr '+ str(f1_wr)+'/n'
+    + 'fs_s1234 '+ str(f1_s1234))
+    file.close()
+
+    save_results(f1, f1_wr, f1_s1234, wavelet, rus, level, features, trees)
+    #save_results(f1, f1_s1, f1_s2, f1_sws, wavelet, rus, level, features, trees)
+    
+    
+    # f = open("MODELO SIMPLE.txt", "w")
+    # #f.write(str(family) + '\n')
+    # f.write('Accuracy- mean: ' + str(np.mean(acc)) +'\n')
+    # f.write('F1 Score - mean: ' + str(np.mean(f1)) +'\n')
+    # f.write('Precision- mean: '+ str(np.mean(prec))+'\n')
+    # f.write('Recall- mean: '+ str(np.mean(recall))+'\n')
+    # f.write('Stage 1: Accuracy- '+ str(np.mean(acc_s1))+ ' Fscore: '+ str(np.mean(f1_s1))+ ' Precision- '+ str(np.mean(prec_s1))+ ' Recall-'+ str(np.mean(recall_s1))+'\n')
+    # f.write('Stage 2: Accuracy- '+ str(np.mean(acc_s2))+ ' Fscore: '+ str(np.mean(f1_s2))+ ' Precision- '+ str(np.mean(prec_s2))+ ' Recall-'+ str(np.mean(recall_s2))+'\n')
+    # f.write('Stage 3: Accuracy- '+ str(np.mean(acc_s3))+ ' Fscore: '+ str(np.mean(f1_s3))+ ' Precision- '+ str(np.mean(prec_s3))+ ' Recall-'+ str(np.mean(recall_s3))+'\n')
+    # f.write('Data: '+ 'f1: '+ str(f1_s1) +'f2 '+ str(f1_s2) +'f3'+ str(f1_s3))
+    # f.close()
+
+def predecir_sj(wavelet, rus, level, features, rf, test, medias, stds,pca=10):
+
+    test_wavelet = wavelet_level(test,level,wavelet,1,medias,stds)
+    y_test = test.events[:,-1]
+
+    test_matrix = np.array(test_wavelet)
+    
+    if features != -1:
+        test_matrix=pca.transform(test_matrix)
+    
+    y_predict = rf.predict(test_matrix)
+
+    #ACOMODAR LABELS PARA SEPARAR EN DOS CLASES
+    # y_test[y_test==1]=1
+    # y_test[y_test==5]=1 
+    # y_test[y_test==2]=2 
+    # y_test[y_test==3]=2 
+    # y_test[y_test==4]=2 
+
+    #WAKE-REM-S1 VS S2-SWS
+    y_test[y_test==1]=1
+    y_test[y_test==5]=1 
+    y_test[y_test==2]=1 
+    y_test[y_test==3]=2 
+    y_test[y_test==4]=2 
+
+
+    acc = (accuracy_score(y_test,y_predict))
+    f1 = (f1_score(y_test,y_predict,average='macro'))
+    
+    #5 CLASES
+    WR, S1234 = multilabel_confusion_matrix(y_test, y_predict)
+
+    acc_wr, f1_wr = metrics.get_metrics(WR,1)
+    acc_s1234, f1_s1234 = metrics.get_metrics(S1234,1)
+
+    #plot_confusion_matrix(rf, test_matrix, y_test)  # doctest: +SKIP
+    #plt.show()  # doctest: +SKIP
+
+   
+    return acc, acc_wr, acc_s1234, f1, f1_wr, f1_s1234
+    #return acc, acc_s1, acc_s2, acc_sws, f1, f1_s1, f1_s2, f1_sws
+
+def get_test_by_age(epoch, sj, total_sj,group,ages):
+    if group == 1:
+        min_age = 26
+        max_age = 35
+    if group == 2:
+        min_age = 50
+        max_age = 60
+    if group == 3:
+        min_age = 66
+        max_age = 75
+    if group == 4:
+        min_age = 85
+        max_age = 101
+    new_epochs = []
+    new_sj = []
+    for i in range(len(total_sj)):
+        if (total_sj[i] in sj) and (ages[i] >= min_age) and (ages[i]<= max_age):
+            index = sj.index(total_sj[i])
+            new_epochs.insert(len(new_epochs),epoch[index])
+            new_sj.insert(len(new_sj),(sj[index])) 
+    return new_epochs,new_sj
+
+def main(wavelet,RUS,level,n_features,n_trees):
+    
+    #epochs, subjects, ages= read_EDF_data_per_sj.get_eeg_data(0,40)
+
+    # seed = random.random()
+    # random.seed(seed)
+    # random.shuffle(epochs)
+    # random.seed(seed)
+    # random.shuffle(subjects)
+    # random.seed(seed)
+    # random.shuffle(ages)
+
+    # cant_train = 70 * len(epochs) / 100
+    # cant_train= int(cant_train)
+
+    #epochs,train_sj = read_EDF_data_per_sj_5.get_eeg_data(0,40,0,'late')
+    #epochs,train_sj = read_EDF_data_per_sj_5.get_eeg_data(41,60,0,'late')
+    epochs,train_sj = read_EDF_data_per_sj_5.get_eeg_data(81,180,0,'late')
+
+
+    print('TERMINO')
+    cant_train = 70 * len(epochs) / 100
+    cant_train= int(cant_train)
+    train_epochs = epochs[:cant_train]
+    test_epochs = epochs[cant_train:]
+
+    #70 entrenamiento 30 test
+    #train_epochs = epochs[:cant_train]
+    #train_sj = subjects[:cant_train]
+
+    # #datos de test
+    #test_epochs = epochs[cant_train:]
+    #test_sj = subjects[cant_train:]
+    #test_epochs = mne.concatenate_epochs(test_epochs)
+
+    #test_epochs, test_sj = get_test_by_age(test_epochs,test_sj,subjects,1,ages)
+    
+
+    #PARA 3 CLASES
+    data= {'fscore': ['General', 'Wake-Rem-s1', 'Stage 2-sws']}
+    
+    df = pd.DataFrame(data)
+    df.to_csv('results_cascade_1.csv')
+
+    acc = np.empty(len(train_epochs))
+    f1 = np.empty(len(train_epochs))
+
+    acc_wr = np.empty(len(train_epochs))
+    f1_wr = np.empty(len(train_epochs))
+
+    acc_s1234 = np.empty(len(train_epochs))
+    f1_s1234 = np.empty(len(train_epochs))
+
+
+    for w in wavelet:
+        for r in RUS:
+            for l in level:
+                for f in n_features:
+                    for t in n_trees:
+                    #preparamos archivo csv para almacenar datos
+                        train(w, r, l, f,t, train_epochs.copy(),test_epochs)
+                        
+
+                        # for i in range(len(train_epochs)):
+                        #     (acc[i], acc_wr[i], acc_s1234[i],
+                        #     f1[i], f1_wr[i], f1_s1234[i]) = train_data(w, r, l, f, t, copy.deepcopy(train_epochs),i)             
+                        # save_results(f1,f1_wr,f1_s1234, w,r,l,f,t)
+    #print('cantidad de sujetos: ', len(train_sj))
+if __name__ == '__main__':
+    #se agregan todos los parametros que pueden pasarse al software cuando se llama
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-w','--wavelet', required=True, nargs='+', type= str, default = 'dmey',help='Lista de las familias de wavelet a utilizar')
+    parser.add_argument('-r', '--RUS', required = True, nargs='+',  type= int, default= 30, help='Porcentaje de reduccion Stage 2')
+    parser.add_argument('-l', '--level', required= True, nargs='+',  type= int, default= 1, help='Nivel de profundidad de las wavelet')
+    parser.add_argument('-f', '--n_features', required= True, nargs='+', type= int, default= 250, help='Cantidad de features reducidas por PCA')
+    parser.add_argument('-t', '--n_trees', required= True, nargs='+', type= int, default= 200, help='Cantidad de features reducidas por PCA')
+    
+    args = parser.parse_args()
+
+#    os.makedirs('./output/checkpoints/', exist_ok=True)
+#
+    main(**vars(args))
